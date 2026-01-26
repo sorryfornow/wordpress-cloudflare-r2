@@ -1,0 +1,58 @@
+{
+  // ============================================
+  // TypeScript 编译器配置
+  // TypeScript Compiler Configuration
+  // ============================================
+  
+  "compilerOptions": {
+    // 编译目标 JavaScript 版本
+    // Target JavaScript version
+    "target": "ES2021",
+    
+    // 模块系统
+    // Module system
+    "module": "ESNext",
+    
+    // 模块解析策略
+    // Module resolution strategy
+    "moduleResolution": "node",
+    
+    // 启用严格类型检查
+    // Enable strict type checking
+    "strict": true,
+    
+    // 允许导入 CommonJS 模块
+    // Allow importing CommonJS modules
+    "esModuleInterop": true,
+    
+    // 跳过库文件类型检查（加快编译）
+    // Skip type checking of library files (faster compilation)
+    "skipLibCheck": true,
+    
+    // 强制文件名大小写一致
+    // Enforce consistent file name casing
+    "forceConsistentCasingInFileNames": true,
+    
+    // 编译输出目录
+    // Compilation output directory
+    "outDir": "./dist",
+    
+    // 源代码根目录
+    // Source code root directory
+    "rootDir": "./src",
+    
+    // 类型定义文件
+    // Type definition files
+    // 包含 Cloudflare Worker 的类型定义
+    // Includes Cloudflare Worker type definitions
+    "types": ["@cloudflare/workers-types"]
+  },
+  
+  // 要编译的文件
+  // Files to compile
+  "include": ["src/**/*"],
+  
+  // 排除的文件
+  // Excluded files
+  "exclude": ["node_modules", "container"]
+}
