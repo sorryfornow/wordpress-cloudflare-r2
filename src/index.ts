@@ -16,16 +16,6 @@ export class WordPressContainer extends Container {
     console.log(`[CONTAINER] Constructor called at ${new Date().toISOString()}`);
   }
 
-  // Called when container starts
-  override onStart(): void {
-    console.log(`[CONTAINER] ====== CONTAINER STARTED ====== ${new Date().toISOString()}`);
-  }
-
-  // Called when container stops/sleeps
-  override onStop(): void {
-    console.log(`[CONTAINER] ====== CONTAINER STOPPED ====== ${new Date().toISOString()}`);
-  }
-
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const pathname = url.pathname;
@@ -99,7 +89,7 @@ export class WordPressContainer extends Container {
           status: "running",
           containerInfo: {
             sleepAfter: "168h (7 days)",
-            cronSchedule: "*/30 * * * * (every 30 minutes)",
+            cronSchedule: "*/15 * * * * (every 15 minutes)",
           },
           backup: {
             files: r2List.objects.length,
@@ -423,17 +413,40 @@ export default {
     console.log(`[CRON] ====== SCHEDULED TASK STARTED ====== ${new Date().toISOString()}`);
     console.log(`[CRON] Event type: ${event.cron}`);
     
+    let keepAliveSuccess = false;
+    
     try {
       const containerId = env.WORDPRESS.idFromName("main");
       const container = env.WORDPRESS.get(containerId);
       
-      // Keep container warm
+      // ALWAYS keep container warm first - this is the most important part
       console.log("[CRON] Sending keep-alive ping...");
-      const pingResponse = await container.fetch(new Request("https://localhost/"));
-      console.log(`[CRON] Ping response status: ${pingResponse.status}`);
+      try {
+        const pingResponse = await container.fetch(new Request("https://localhost/__status"));
+        console.log(`[CRON] Keep-alive ping response: ${pingResponse.status}`);
+        keepAliveSuccess = pingResponse.ok;
+      } catch (pingError) {
+        console.error("[CRON] Keep-alive ping failed:", pingError);
+        // Try a simpler ping
+        try {
+          const simplePing = await container.fetch(new Request("https://localhost/"));
+          console.log(`[CRON] Simple ping response: ${simplePing.status}`);
+          keepAliveSuccess = true;
+        } catch (e) {
+          console.error("[CRON] Simple ping also failed:", e);
+        }
+      }
+      
+      if (!keepAliveSuccess) {
+        console.log("[CRON] ⚠️ Could not reach container, skipping backup");
+        console.log(`[CRON] ====== SCHEDULED TASK ENDED (container unreachable) ====== ${new Date().toISOString()}`);
+        return;
+      }
       
       // Check if WordPress is installed before backing up
       console.log("[CRON] Checking if WordPress is installed...");
+      let shouldBackup = false;
+      
       try {
         const checkResponse = await container.fetch(
           new Request("https://localhost/__trigger_backup.php?action=check")
@@ -444,16 +457,19 @@ export default {
           
           if (checkData.needsRestore) {
             console.log("[CRON] ⚠️ WordPress is NOT installed yet, skipping backup");
-            console.log("[CRON] Please complete WordPress installation first");
-            console.log(`[CRON] ====== SCHEDULED TASK ENDED (no backup) ====== ${new Date().toISOString()}`);
-            return;
+          } else {
+            console.log("[CRON] ✅ WordPress is installed, will proceed with backup");
+            shouldBackup = true;
           }
-          
-          console.log("[CRON] ✅ WordPress is installed, proceeding with backup");
         }
       } catch (checkError) {
-        console.log("[CRON] Could not check WordPress status, skipping backup for safety");
-        console.log(`[CRON] ====== SCHEDULED TASK ENDED (check failed) ====== ${new Date().toISOString()}`);
+        console.log("[CRON] Could not check WordPress status:", checkError);
+        // Don't skip backup entirely - try anyway
+        shouldBackup = true;
+      }
+      
+      if (!shouldBackup) {
+        console.log(`[CRON] ====== SCHEDULED TASK ENDED (no backup needed) ====== ${new Date().toISOString()}`);
         return;
       }
       
