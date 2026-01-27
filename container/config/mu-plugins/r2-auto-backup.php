@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Auto Backup After Install
  * Description: Automatically triggers backup after WordPress installation or important changes
- * Version: 1.0
+ * Version: 2.0
  * 
  * This is a "must-use" plugin that runs automatically.
  * It triggers a backup after:
@@ -17,14 +17,33 @@ if (!defined('ABSPATH')) {
 }
 
 /**
- * Trigger backup by calling the sync script
+ * Trigger backup by calling the Worker's backup endpoint
+ * This ensures the backup is actually uploaded to R2
  */
 function r2_trigger_backup() {
-    // Run backup in background (non-blocking)
-    exec('/scripts/sync.sh push > /var/log/backup.log 2>&1 &');
+    // First, generate local backup files
+    exec('/scripts/sync.sh push > /var/log/backup.log 2>&1');
     
     // Log the trigger
-    error_log('[R2 Backup] Backup triggered at ' . date('Y-m-d H:i:s'));
+    error_log('[R2 Backup] Local backup generated at ' . date('Y-m-d H:i:s'));
+    
+    // Note: The actual R2 upload will happen when:
+    // 1. Cron triggers (every 2 minutes)
+    // 2. User visits /__backup/now
+    // We can't call the Worker from inside the container directly
+}
+
+/**
+ * Trigger full backup via HTTP (for admin-initiated backups)
+ */
+function r2_trigger_full_backup() {
+    // Generate local files first
+    exec('/scripts/sync.sh push > /var/log/backup.log 2>&1');
+    
+    // The Worker will pick these up on next cron or manual trigger
+    error_log('[R2 Backup] Full backup prepared at ' . date('Y-m-d H:i:s'));
+    
+    return true;
 }
 
 /**
@@ -117,11 +136,13 @@ add_action('admin_notices', function() {
     if ($response) {
         $data = json_decode($response, true);
         $last_backup = $data['backup']['lastBackup'] ?? 'Never';
+        $is_valid = $data['backup']['isValid'] ?? false;
         
-        if ($last_backup === 'Never') {
+        if ($last_backup === 'Never' || !$is_valid) {
             echo '<div class="notice notice-warning"><p>';
-            echo '<strong>R2 Backup:</strong> No backup found yet. ';
-            echo '<a href="' . admin_url('admin.php?page=r2-backup-now') . '">Trigger backup now</a> or wait for automatic backup (every 5 minutes).';
+            echo '<strong>R2 Backup:</strong> No valid backup found. ';
+            echo 'Automatic backup runs every 2 minutes, or ';
+            echo '<a href="' . admin_url('tools.php?page=r2-backup') . '">go to backup page</a>.';
             echo '</p></div>';
         }
     }
@@ -146,16 +167,22 @@ add_action('admin_menu', function() {
 function r2_backup_page() {
     // Handle manual backup trigger
     if (isset($_POST['trigger_backup']) && check_admin_referer('r2_backup_nonce')) {
-        r2_trigger_backup();
-        echo '<div class="notice notice-success"><p>Backup triggered! Please wait 10-30 seconds and refresh to see status.</p></div>';
+        r2_trigger_full_backup();
+        echo '<div class="notice notice-success"><p>';
+        echo '<strong>Backup files generated!</strong> ';
+        echo 'The backup will be uploaded to R2 within 2 minutes (next cron run), or ';
+        echo 'visit <a href="/__backup/now" target="_blank">/__backup/now</a> to upload immediately.';
+        echo '</p></div>';
     }
     
     // Get status
-    $status = ['backup' => ['lastBackup' => 'Unknown', 'files' => 0, 'totalSizeMB' => '0']];
+    $status = ['backup' => ['lastBackup' => 'Unknown', 'files' => 0, 'totalSizeMB' => '0', 'isValid' => false]];
     $response = @file_get_contents('http://localhost/__status');
     if ($response) {
         $status = json_decode($response, true);
     }
+    
+    $is_valid = $status['backup']['isValid'] ?? false;
     
     ?>
     <div class="wrap">
@@ -168,6 +195,16 @@ function r2_backup_page() {
                 <td><?php echo esc_html($status['backup']['lastBackup'] ?? 'Never'); ?></td>
             </tr>
             <tr>
+                <th>Backup Valid</th>
+                <td>
+                    <?php if ($is_valid): ?>
+                        <span style="color: green;">✅ Yes (database.sql ≥ 50KB)</span>
+                    <?php else: ?>
+                        <span style="color: red;">❌ No (database.sql < 50KB or missing)</span>
+                    <?php endif; ?>
+                </td>
+            </tr>
+            <tr>
                 <th>Backup Files</th>
                 <td><?php echo esc_html($status['backup']['files'] ?? 0); ?></td>
             </tr>
@@ -178,32 +215,36 @@ function r2_backup_page() {
         </table>
         
         <h2>Manual Backup</h2>
-        <p>Backups run automatically every 5 minutes. Use this button to trigger an immediate backup.</p>
+        <p>Backups run automatically every <strong>2 minutes</strong>. Use this button to prepare backup files immediately.</p>
         
-        <form method="post">
+        <form method="post" style="margin-bottom: 20px;">
             <?php wp_nonce_field('r2_backup_nonce'); ?>
             <p>
-                <input type="submit" name="trigger_backup" class="button button-primary" value="Backup Now">
+                <input type="submit" name="trigger_backup" class="button button-primary" value="Prepare Backup Files">
             </p>
         </form>
         
+        <p>
+            <a href="/__backup/now" target="_blank" class="button">Upload to R2 Now (opens in new tab)</a>
+            <a href="/__status" target="_blank" class="button">View Full Status</a>
+        </p>
+        
         <h2>How It Works</h2>
         <ul>
-            <li>✅ Database is backed up to Cloudflare R2</li>
-            <li>✅ wp-content folder (themes, plugins, uploads) is backed up</li>
-            <li>✅ Automatic backup every 5 minutes via cron</li>
-            <li>✅ Automatic backup after theme/plugin changes</li>
-            <li>✅ Data restored automatically when container restarts</li>
+            <li>✅ Cron runs every <strong>2 minutes</strong> to keep container alive</li>
+            <li>✅ Database and wp-content are backed up to Cloudflare R2</li>
+            <li>✅ Only valid backups are saved (database.sql ≥ 50KB)</li>
+            <li>✅ Auto-restore when container restarts (if valid backup exists)</li>
+            <li>✅ Additional backups after theme/plugin changes</li>
         </ul>
         
-        <h2>Important</h2>
-        <p><strong>Before redeploying (npx wrangler deploy):</strong></p>
-        <ol>
-            <li>Check the "Last Backup" time above</li>
-            <li>If your recent changes aren't backed up yet, click "Backup Now"</li>
-            <li>Wait 10-30 seconds and refresh to confirm backup completed</li>
-            <li>Then proceed with deployment</li>
-        </ol>
+        <h2>Important Notes</h2>
+        <ul>
+            <li>⏱️ After WordPress installation, wait up to 2 minutes for first backup</li>
+            <li>🔄 Container may restart due to Cloudflare infrastructure updates</li>
+            <li>✅ With valid backup, your site will auto-restore after restart</li>
+        </ul>
     </div>
     <?php
 }
+

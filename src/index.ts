@@ -89,7 +89,7 @@ export class WordPressContainer extends Container {
           status: "running",
           containerInfo: {
             sleepAfter: "168h (7 days)",
-            cronSchedule: "*/15 * * * * (every 15 minutes)",
+            cronSchedule: "*/2 * * * * (every 2 minutes)",
           },
           backup: {
             files: r2List.objects.length,
