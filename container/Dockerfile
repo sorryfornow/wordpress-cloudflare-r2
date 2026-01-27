@@ -196,6 +196,10 @@ COPY scripts/init-db.sh /scripts/init-db.sh
 # WordPress configuration file
 COPY config/wp-config.php /var/www/html/wp-config.php
 
+# WordPress .htaccess 文件 (URL 重写规则，REST API 需要)
+# WordPress .htaccess file (URL rewrite rules, needed for REST API)
+COPY config/.htaccess /var/www/html/.htaccess
+
 # 备份触发脚本 (用于手动触发备份)
 # Backup trigger script (for manual backup trigger)
 COPY config/__trigger_backup.php /var/www/html/__trigger_backup.php

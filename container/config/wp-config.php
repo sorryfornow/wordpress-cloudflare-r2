@@ -156,6 +156,20 @@ if (isset($_SERVER['HTTP_CF_CONNECTING_IP'])) {
     $_SERVER['REMOTE_ADDR'] = $_SERVER['HTTP_CF_CONNECTING_IP'];
 }
 
+/**
+ * 动态设置 WordPress URL
+ * Dynamically set WordPress URL
+ * 
+ * 这让 WordPress 自动检测正确的 URL，确保 REST API 正常工作
+ * This lets WordPress auto-detect the correct URL, ensuring REST API works
+ */
+if (isset($_SERVER['HTTP_HOST'])) {
+    $protocol = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? 'https' : 'http';
+    $site_url = $protocol . '://' . $_SERVER['HTTP_HOST'];
+    define('WP_HOME', $site_url);
+    define('WP_SITEURL', $site_url);
+}
+
 // ============================================
 // 文件系统设置 / Filesystem Settings
 // ============================================
