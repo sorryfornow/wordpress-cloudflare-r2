@@ -5,9 +5,75 @@ interface Env {
   DATA_BUCKET: R2Bucket;
 }
 
+// ============================================================
+// 持久化事件日志 — 写入 R2 的 logs/events.json
+// Persistent event log — writes to R2 logs/events.json
+// ============================================================
+type EventType =
+  | "CONTAINER_RECYCLED"   // install.php 被访问，容器已回收
+  | "RESTORE_START"        // 开始从 R2 镜像恢复
+  | "RESTORE_SUCCESS"      // 镜像恢复成功
+  | "RESTORE_FAILED"       // 镜像恢复失败
+  | "RESTORE_SKIPPED"      // 备份无效，跳过恢复
+  | "BACKUP_COMPLETE"      // 备份写入 R2 成功
+  | "BACKUP_FAILED"        // 备份失败
+  | "MANUAL_RESTORE"       // 手动触发恢复
+  | "MANUAL_BACKUP";       // 手动触发备份
+
+interface LogEvent {
+  time: string;
+  type: EventType;
+  [key: string]: unknown;
+}
+
+// 保留最近 90 天的事件，无条数上限
+// Keep events from the last 90 days, no entry count cap
+const RETENTION_DAYS = 90;
+
+async function logEvent(
+  bucket: R2Bucket,
+  type: EventType,
+  details: Record<string, unknown> = {}
+): Promise<void> {
+  try {
+    const event: LogEvent = {
+      time: new Date().toISOString(),
+      type,
+      ...details,
+    };
+
+    let events: LogEvent[] = [];
+    try {
+      const existing = await bucket.get("logs/events.json");
+      if (existing) {
+        events = JSON.parse(await existing.text());
+      }
+    } catch {
+      events = [];
+    }
+
+    // Prepend new event
+    events.unshift(event);
+
+    // Drop anything older than RETENTION_DAYS
+    const cutoff = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    events = events.filter(e => new Date(e.time).getTime() >= cutoff);
+
+    await bucket.put("logs/events.json", JSON.stringify(events, null, 2), {
+      httpMetadata: { contentType: "application/json" },
+    });
+
+    console.log(`[LOG] Event recorded: ${type} at ${event.time}`);
+  } catch (e) {
+    console.error("[LOG] Failed to write event log:", e);
+  }
+}
+
+// ============================================================
+
 export class WordPressContainer extends Container {
   defaultPort = 80;
-  sleepAfter = "168h";  // 7 days = 168 hours (maximum)
+  sleepAfter = "168h";
   env: Env;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -22,7 +88,6 @@ export class WordPressContainer extends Container {
     
     console.log(`[REQUEST] ${request.method} ${pathname} at ${new Date().toISOString()}`);
 
-    // R2 API endpoints
     if (pathname === "/r2/list") {
       try {
         const listed = await this.env.DATA_BUCKET.list();
@@ -67,7 +132,7 @@ export class WordPressContainer extends Container {
       }
     }
 
-    // Status endpoint
+    // ── Status endpoint ──────────────────────────────────────
     if (pathname === "/__status") {
       try {
         const r2List = await this.env.DATA_BUCKET.list({ prefix: "backup/" });
@@ -80,7 +145,6 @@ export class WordPressContainer extends Container {
           }
         } catch {}
         
-        // Check if backup is valid (database.sql > 50KB)
         const dbBackup = r2List.objects.find(obj => obj.key === "backup/database.sql");
         const minDbSize = 50 * 1024;
         const isValidBackup = dbBackup && dbBackup.size >= minDbSize;
@@ -99,70 +163,105 @@ export class WordPressContainer extends Container {
             lastBackup: lastBackup,
             isValid: isValidBackup,
             validationNote: isValidBackup 
-              ? "✅ Backup is valid (database.sql > 50KB)" 
-              : "⚠️ Backup may be invalid (database.sql < 50KB or missing). Please complete WordPress setup and run /__backup/now",
+              ? "Backup is valid (database.sql > 50KB)" 
+              : "Backup may be invalid. Please complete WordPress setup and run /__backup/now",
           },
           endpoints: {
             status: "/__status",
+            logs: "/__logs",
             backupNow: "/__backup/now",
             restoreNow: "/__restore/now",
             reboot: "/__reboot",
           },
-          note: "View logs in Cloudflare Dashboard → Workers & Pages → wordpress-r2 → Logs → Real-time Logs",
         });
       } catch (error) {
         return Response.json({ error: String(error) }, { status: 500 });
       }
     }
 
-    // Manual backup trigger endpoint
+    // ── Persistent event log endpoint ─────────────────────────
+    if (pathname === "/__logs") {
+      try {
+        const logsObj = await this.env.DATA_BUCKET.get("logs/events.json");
+        if (!logsObj) {
+          return Response.json({ events: [], total: 0, message: "No events recorded yet." }, {
+            headers: { "Access-Control-Allow-Origin": "*" },
+          });
+        }
+        const events: LogEvent[] = JSON.parse(await logsObj.text());
+
+        const filterType = url.searchParams.get("type");
+        const filtered = filterType ? events.filter(e => e.type === filterType) : events;
+        const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+        const paged = filtered.slice(0, limit);
+
+        return Response.json({ events: paged, total: events.length, filtered: filtered.length, showing: paged.length }, {
+          headers: { "Access-Control-Allow-Origin": "*" },
+        });
+      } catch (error) {
+        return Response.json({ error: String(error) }, { status: 500 });
+      }
+    }
+
+    // ── Manual backup ─────────────────────────────────────────
     if (pathname === "/__backup/now") {
       return await this.handleBackup(request);
     }
 
-    // Manual restore endpoint
+    // ── Manual restore ────────────────────────────────────────
     if (pathname === "/__restore/now") {
       return await this.handleRestore(request);
     }
 
-    // Reboot endpoint
+    // ── Reboot ────────────────────────────────────────────────
     if (pathname === "/__reboot") {
       return new Response("Reboot requested. Please wait 2 minutes and refresh.", {
         headers: { "Content-Type": "text/plain" },
       });
     }
 
-    // AUTO-RESTORE: Intercept install.php requests
+    // ── AUTO-RESTORE: Intercept install.php (container recycled) ──
     if (pathname.includes("install.php")) {
       console.log("[AUTO-RESTORE] ====== DETECTED INSTALL.PHP ======");
-      console.log(`[AUTO-RESTORE] Full URL: ${request.url}`);
-      
-      // Check if R2 has backup
+
+      await logEvent(this.env.DATA_BUCKET, "CONTAINER_RECYCLED", {
+        url: request.url,
+        userAgent: request.headers.get("user-agent") || "unknown",
+        message: "install.php accessed — container recycled and lost state",
+      });
+
       const r2List = await this.env.DATA_BUCKET.list({ prefix: "backup/" });
-      console.log(`[AUTO-RESTORE] R2 backup files count: ${r2List.objects.length}`);
-      
-      // Find database.sql and check its size
       const dbBackup = r2List.objects.find(obj => obj.key === "backup/database.sql");
-      const minDbSize = 50 * 1024; // 50 KB minimum for valid WordPress database
+      const minDbSize = 50 * 1024;
       
       if (dbBackup) {
-        console.log(`[AUTO-RESTORE] database.sql size: ${dbBackup.size} bytes`);
-        
         if (dbBackup.size < minDbSize) {
-          console.log(`[AUTO-RESTORE] ⚠️ database.sql is too small (${dbBackup.size} bytes < ${minDbSize} bytes)`);
-          console.log("[AUTO-RESTORE] This looks like an empty database backup, skipping restore");
-          console.log("[AUTO-RESTORE] Please complete WordPress installation and run /__backup/now");
-          // Don't restore, let user complete fresh installation
+          await logEvent(this.env.DATA_BUCKET, "RESTORE_SKIPPED", {
+            reason: "database.sql too small",
+            dbSize: dbBackup.size,
+            minRequired: minDbSize,
+          });
         } else if (r2List.objects.length >= 2) {
-          console.log("[AUTO-RESTORE] Backup is valid, performing automatic restore...");
+          await logEvent(this.env.DATA_BUCKET, "RESTORE_START", {
+            trigger: "auto (install.php)",
+            r2Files: r2List.objects.map(o => ({ key: o.key, size: o.size })),
+          });
           
           try {
             const restoreResult = await this.performRestore(request.url);
-            console.log(`[AUTO-RESTORE] Restore result: success=${restoreResult.success}`);
             
             if (restoreResult.success) {
-              console.log("[AUTO-RESTORE] ====== RESTORE SUCCESSFUL ======");
-              // Return a page that redirects to homepage
+              let snapshotTime = "unknown";
+              try {
+                const tsObj = await this.env.DATA_BUCKET.get("backup/timestamp.txt");
+                if (tsObj) snapshotTime = (await tsObj.text()).trim();
+              } catch {}
+
+              await logEvent(this.env.DATA_BUCKET, "RESTORE_SUCCESS", {
+                trigger: "auto (install.php)",
+                snapshotTimestamp: snapshotTime,
+              });
+
               return new Response(
                 `<!DOCTYPE html>
 <html>
@@ -178,30 +277,34 @@ export class WordPressContainer extends Container {
 </head>
 <body>
   <h1 class="success">✅ WordPress Restored from Backup!</h1>
+  <p>Snapshot time: <strong>${snapshotTime}</strong></p>
   <p>Redirecting to homepage in 3 seconds...</p>
   <p><a href="/">Click here if not redirected</a></p>
   <pre>${restoreResult.message}</pre>
 </body>
 </html>`,
-                {
-                  status: 200,
-                  headers: { "Content-Type": "text/html; charset=utf-8" }
-                }
+                { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } }
               );
             } else {
-              console.log("[AUTO-RESTORE] ====== RESTORE FAILED ======");
-              console.log(`[AUTO-RESTORE] Failure message: ${restoreResult.message}`);
+              await logEvent(this.env.DATA_BUCKET, "RESTORE_FAILED", {
+                trigger: "auto (install.php)",
+                message: restoreResult.message.slice(0, 500),
+              });
             }
           } catch (e) {
-            console.error("[AUTO-RESTORE] Exception:", e);
+            await logEvent(this.env.DATA_BUCKET, "RESTORE_FAILED", {
+              trigger: "auto (install.php)",
+              error: String(e),
+            });
           }
         }
       } else {
-        console.log("[AUTO-RESTORE] No database.sql in R2, showing fresh install page");
+        await logEvent(this.env.DATA_BUCKET, "RESTORE_SKIPPED", {
+          reason: "No database.sql in R2 — fresh install",
+        });
       }
     }
 
-    // Forward all other requests to container
     try {
       return await this.containerFetch(request);
     } catch (error) {
@@ -209,12 +312,11 @@ export class WordPressContainer extends Container {
     }
   }
 
-  // Handle backup request
   private async handleBackup(request: Request): Promise<Response> {
     const results: string[] = [];
-    
+    await logEvent(this.env.DATA_BUCKET, "MANUAL_BACKUP", { trigger: "manual /__backup/now" });
+
     try {
-      // Step 1: Generate backup files
       results.push("Step 1: Generating backup files in container...");
       const generateResponse = await this.containerFetch(
         new Request(new URL("/__trigger_backup.php?action=generate", request.url).toString())
@@ -223,45 +325,35 @@ export class WordPressContainer extends Container {
       results.push(generateResult);
       
       if (!generateResult.includes("Backup Files Ready")) {
-        return new Response(
-          `Backup generation failed:\n\n${results.join("\n")}`,
-          { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } }
-        );
+        await logEvent(this.env.DATA_BUCKET, "BACKUP_FAILED", { reason: "Generation failed", output: generateResult.slice(0, 500) });
+        return new Response(`Backup generation failed:\n\n${results.join("\n")}`,
+          { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } });
       }
       
-      // Step 2: Check database.sql size before uploading
       results.push("\nStep 2: Validating backup...");
       const dbResponse = await this.containerFetch(
         new Request(new URL("/__trigger_backup.php?action=get&file=database.sql", request.url).toString())
       );
       
       if (!dbResponse.ok) {
-        results.push("❌ Failed to fetch database.sql");
+        await logEvent(this.env.DATA_BUCKET, "BACKUP_FAILED", { reason: "Failed to fetch database.sql" });
         return new Response(results.join("\n"), { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } });
       }
       
       const dbData = await dbResponse.arrayBuffer();
-      const minDbSize = 50 * 1024; // 50 KB minimum
+      const minDbSize = 50 * 1024;
       
       if (dbData.byteLength < minDbSize) {
-        results.push(`❌ database.sql is too small: ${(dbData.byteLength / 1024).toFixed(1)} KB`);
-        results.push(`   Minimum required: ${minDbSize / 1024} KB`);
-        results.push("");
-        results.push("⚠️ WordPress may not be fully installed yet.");
-        results.push("Please complete WordPress installation first, then run backup again.");
+        await logEvent(this.env.DATA_BUCKET, "BACKUP_FAILED", { reason: "database.sql too small", size: dbData.byteLength });
         return new Response(results.join("\n"), { status: 400, headers: { "Content-Type": "text/plain; charset=utf-8" } });
       }
       
       results.push(`✅ database.sql size OK: ${(dbData.byteLength / 1024).toFixed(1)} KB`);
-      
-      // Step 3: Upload to R2
       results.push("\nStep 3: Uploading files to R2...");
       
-      // Upload database.sql (already fetched)
       await this.env.DATA_BUCKET.put("backup/database.sql", dbData);
       results.push(`  ✅ database.sql uploaded (${(dbData.byteLength / 1024).toFixed(1)} KB)`);
       
-      // Upload wp-content.tar.gz
       const wpResponse = await this.containerFetch(
         new Request(new URL("/__trigger_backup.php?action=get&file=wp-content.tar.gz", request.url).toString())
       );
@@ -269,130 +361,100 @@ export class WordPressContainer extends Container {
         const wpData = await wpResponse.arrayBuffer();
         await this.env.DATA_BUCKET.put("backup/wp-content.tar.gz", wpData);
         results.push(`  ✅ wp-content.tar.gz uploaded (${(wpData.byteLength / 1024).toFixed(1)} KB)`);
-      } else {
-        results.push(`  ❌ Failed to fetch wp-content.tar.gz`);
       }
       
-      // Upload timestamp.txt
       const tsResponse = await this.containerFetch(
         new Request(new URL("/__trigger_backup.php?action=get&file=timestamp.txt", request.url).toString())
       );
       if (tsResponse.ok) {
         const tsData = await tsResponse.arrayBuffer();
         await this.env.DATA_BUCKET.put("backup/timestamp.txt", tsData);
-        results.push(`  ✅ timestamp.txt uploaded`);
       }
+
+      let snapshotTime = new Date().toISOString();
+      try {
+        const tsObj = await this.env.DATA_BUCKET.get("backup/timestamp.txt");
+        if (tsObj) snapshotTime = (await tsObj.text()).trim();
+      } catch {}
+      
+      await logEvent(this.env.DATA_BUCKET, "BACKUP_COMPLETE", {
+        trigger: "manual /__backup/now",
+        snapshotTimestamp: snapshotTime,
+        dbSizeKB: (dbData.byteLength / 1024).toFixed(1),
+      });
       
       results.push("\n=== Backup Complete ===");
-      results.push("Visit /__status to verify.");
-      
-      return new Response(results.join("\n"), {
-        status: 200,
-        headers: { "Content-Type": "text/plain; charset=utf-8" }
-      });
+      return new Response(results.join("\n"), { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" } });
     } catch (error) {
+      await logEvent(this.env.DATA_BUCKET, "BACKUP_FAILED", { error: String(error) });
       return new Response(`Backup failed: ${String(error)}`, { status: 500 });
     }
   }
 
-  // Handle restore request
   private async handleRestore(request: Request): Promise<Response> {
+    await logEvent(this.env.DATA_BUCKET, "MANUAL_RESTORE", { trigger: "manual /__restore/now" });
+    await logEvent(this.env.DATA_BUCKET, "RESTORE_START", { trigger: "manual /__restore/now" });
+
     const result = await this.performRestore(request.url);
+
+    if (result.success) {
+      let snapshotTime = "unknown";
+      try {
+        const tsObj = await this.env.DATA_BUCKET.get("backup/timestamp.txt");
+        if (tsObj) snapshotTime = (await tsObj.text()).trim();
+      } catch {}
+      await logEvent(this.env.DATA_BUCKET, "RESTORE_SUCCESS", {
+        trigger: "manual /__restore/now",
+        snapshotTimestamp: snapshotTime,
+      });
+    } else {
+      await logEvent(this.env.DATA_BUCKET, "RESTORE_FAILED", {
+        trigger: "manual /__restore/now",
+        message: result.message.slice(0, 500),
+      });
+    }
     
     return new Response(
-      `=== Manual Restore ===\n\n${result.message}\n\n${result.success ? "✅ Restore Complete! Please refresh the page." : "❌ Restore Failed"}`,
-      {
-        status: result.success ? 200 : 500,
-        headers: { "Content-Type": "text/plain; charset=utf-8" }
-      }
+      `=== Manual Restore ===\n\n${result.message}\n\n${result.success ? "✅ Restore Complete!" : "❌ Restore Failed"}`,
+      { status: result.success ? 200 : 500, headers: { "Content-Type": "text/plain; charset=utf-8" } }
     );
   }
 
-  // Perform restore from R2 to container
   private async performRestore(baseUrl: string): Promise<{ success: boolean; message: string }> {
     const logs: string[] = [];
-    console.log("[RESTORE] ====== Starting performRestore ======");
-    
     try {
-      // Check R2 backup
       const r2List = await this.env.DATA_BUCKET.list({ prefix: "backup/" });
       logs.push(`R2 backup files: ${r2List.objects.length}`);
-      console.log(`[RESTORE] R2 backup files: ${r2List.objects.length}`);
-      
-      if (r2List.objects.length === 0) {
-        console.log("[RESTORE] No backup found in R2");
-        return { success: false, message: "No backup found in R2" };
-      }
-
-      for (const obj of r2List.objects) {
-        logs.push(`  - ${obj.key} (${(obj.size / 1024).toFixed(1)} KB)`);
-      }
+      if (r2List.objects.length === 0) return { success: false, message: "No backup found in R2" };
+      for (const obj of r2List.objects) logs.push(`  - ${obj.key} (${(obj.size / 1024).toFixed(1)} KB)`);
       logs.push("");
 
-      // Push files to container
       for (const file of ["database.sql", "wp-content.tar.gz", "timestamp.txt"]) {
         try {
-          console.log(`[RESTORE] Getting ${file} from R2...`);
           const r2Object = await this.env.DATA_BUCKET.get(`backup/${file}`);
-          if (!r2Object) {
-            logs.push(`⚠️ No ${file} in R2, skipping`);
-            console.log(`[RESTORE] No ${file} in R2`);
-            continue;
-          }
-          
+          if (!r2Object) { logs.push(`⚠️ No ${file} in R2, skipping`); continue; }
           const fileData = await r2Object.arrayBuffer();
           logs.push(`Pushing ${file} (${(fileData.byteLength / 1024).toFixed(1)} KB)...`);
-          console.log(`[RESTORE] Pushing ${file} (${fileData.byteLength} bytes) to container...`);
-          
-          const restoreUrl = new URL(`/__trigger_backup.php?action=restore&file=${file}`, baseUrl).toString();
-          console.log(`[RESTORE] POST to: ${restoreUrl}`);
-          
           const restoreResponse = await this.containerFetch(
-            new Request(restoreUrl, {
-              method: "POST",
-              body: fileData,
+            new Request(new URL(`/__trigger_backup.php?action=restore&file=${file}`, baseUrl).toString(), {
+              method: "POST", body: fileData,
               headers: { "Content-Type": "application/octet-stream" }
             })
           );
-          
-          console.log(`[RESTORE] Response status: ${restoreResponse.status}`);
-          
-          if (restoreResponse.ok) {
-            const responseText = await restoreResponse.text();
-            logs.push(`  ✅ ${file} pushed to container`);
-            console.log(`[RESTORE] ✅ ${file} pushed: ${responseText}`);
-          } else {
-            const errorText = await restoreResponse.text();
-            logs.push(`  ❌ Failed: ${restoreResponse.status}`);
-            console.log(`[RESTORE] ❌ ${file} failed: ${restoreResponse.status} - ${errorText}`);
-          }
-        } catch (fileError) {
-          logs.push(`  ❌ Error: ${String(fileError)}`);
-          console.error(`[RESTORE] Exception for ${file}:`, fileError);
-        }
+          logs.push(restoreResponse.ok ? `  ✅ ${file} pushed` : `  ❌ Failed: ${restoreResponse.status}`);
+        } catch (e) { logs.push(`  ❌ Error: ${String(e)}`); }
       }
       
-      // Apply restore
       logs.push("\nApplying restore...");
-      console.log("[RESTORE] Applying restore...");
-      
-      const applyUrl = new URL("/__trigger_backup.php?action=apply", baseUrl).toString();
-      console.log(`[RESTORE] GET: ${applyUrl}`);
-      
       const applyResponse = await this.containerFetch(
-        new Request(applyUrl)
+        new Request(new URL("/__trigger_backup.php?action=apply", baseUrl).toString())
       );
       const applyResult = await applyResponse.text();
       logs.push(applyResult);
-      console.log(`[RESTORE] Apply result: ${applyResult}`);
-      
       const success = applyResult.includes("Database restored") || applyResult.includes("✅");
-      console.log(`[RESTORE] ====== performRestore finished, success=${success} ======`);
       return { success, message: logs.join("\n") };
     } catch (error) {
-      logs.push(`Error: ${String(error)}`);
-      console.error("[RESTORE] Exception:", error);
-      return { success: false, message: logs.join("\n") };
+      return { success: false, message: logs.join("\n") + `\nError: ${String(error)}` };
     }
   }
 }
@@ -408,142 +470,78 @@ export default {
     }
   },
 
-  // Cron: runs every 30 minutes to keep alive and backup
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     console.log(`[CRON] ====== SCHEDULED TASK STARTED ====== ${new Date().toISOString()}`);
-    console.log(`[CRON] Event type: ${event.cron}`);
-    
     let keepAliveSuccess = false;
     
     try {
       const containerId = env.WORDPRESS.idFromName("main");
       const container = env.WORDPRESS.get(containerId);
       
-      // ALWAYS keep container warm first - this is the most important part
-      console.log("[CRON] Sending keep-alive ping...");
       try {
         const pingResponse = await container.fetch(new Request("https://localhost/__status"));
-        console.log(`[CRON] Keep-alive ping response: ${pingResponse.status}`);
         keepAliveSuccess = pingResponse.ok;
-      } catch (pingError) {
-        console.error("[CRON] Keep-alive ping failed:", pingError);
-        // Try a simpler ping
+        console.log(`[CRON] Keep-alive ping: ${pingResponse.status}`);
+      } catch {
         try {
-          const simplePing = await container.fetch(new Request("https://localhost/"));
-          console.log(`[CRON] Simple ping response: ${simplePing.status}`);
+          await container.fetch(new Request("https://localhost/"));
           keepAliveSuccess = true;
-        } catch (e) {
-          console.error("[CRON] Simple ping also failed:", e);
-        }
+        } catch (e) { console.error("[CRON] Simple ping failed:", e); }
       }
       
-      if (!keepAliveSuccess) {
-        console.log("[CRON] ⚠️ Could not reach container, skipping backup");
-        console.log(`[CRON] ====== SCHEDULED TASK ENDED (container unreachable) ====== ${new Date().toISOString()}`);
-        return;
-      }
+      if (!keepAliveSuccess) { console.log("[CRON] Container unreachable, skipping backup"); return; }
       
-      // Check if WordPress is installed before backing up
-      console.log("[CRON] Checking if WordPress is installed...");
       let shouldBackup = false;
-      
       try {
         const checkResponse = await container.fetch(
           new Request("https://localhost/__trigger_backup.php?action=check")
         );
-        
         if (checkResponse.ok) {
           const checkData = await checkResponse.json() as { needsRestore: boolean };
-          
-          if (checkData.needsRestore) {
-            console.log("[CRON] ⚠️ WordPress is NOT installed yet, skipping backup");
-          } else {
-            console.log("[CRON] ✅ WordPress is installed, will proceed with backup");
-            shouldBackup = true;
-          }
+          shouldBackup = !checkData.needsRestore;
         }
-      } catch (checkError) {
-        console.log("[CRON] Could not check WordPress status:", checkError);
-        // Don't skip backup entirely - try anyway
-        shouldBackup = true;
-      }
+      } catch { shouldBackup = true; }
       
-      if (!shouldBackup) {
-        console.log(`[CRON] ====== SCHEDULED TASK ENDED (no backup needed) ====== ${new Date().toISOString()}`);
-        return;
-      }
+      if (!shouldBackup) return;
       
-      // Trigger backup
-      console.log("[CRON] Starting backup...");
       try {
         const generateResponse = await container.fetch(
           new Request("https://localhost/__trigger_backup.php?action=generate")
         );
-        
-        console.log(`[CRON] Generate response status: ${generateResponse.status}`);
-        
         if (generateResponse.ok) {
           const generateText = await generateResponse.text();
-          console.log(`[CRON] Generate result contains 'Backup Files Ready': ${generateText.includes("Backup Files Ready")}`);
-          
           if (generateText.includes("Backup Files Ready")) {
-            // Check database.sql size before uploading
             const dbCheckResponse = await container.fetch(
               new Request("https://localhost/__trigger_backup.php?action=get&file=database.sql")
             );
-            
             if (dbCheckResponse.ok) {
               const dbData = await dbCheckResponse.arrayBuffer();
-              const minDbSize = 50 * 1024; // 50 KB minimum
-              
-              if (dbData.byteLength < minDbSize) {
-                console.log(`[CRON] ⚠️ database.sql is too small (${dbData.byteLength} bytes < ${minDbSize} bytes)`);
-                console.log("[CRON] Skipping backup - WordPress may not be fully installed");
-                console.log(`[CRON] ====== SCHEDULED TASK ENDED (invalid backup) ====== ${new Date().toISOString()}`);
+              if (dbData.byteLength < 50 * 1024) {
+                await logEvent(env.DATA_BUCKET, "BACKUP_FAILED", { trigger: "cron", reason: "database.sql too small", size: dbData.byteLength });
                 return;
               }
-              
-              console.log(`[CRON] ✅ database.sql size OK: ${dbData.byteLength} bytes`);
-              
-              // Upload database.sql
               await env.DATA_BUCKET.put("backup/database.sql", dbData);
-              console.log(`[CRON] ✅ database.sql backed up (${dbData.byteLength} bytes)`);
             }
             
-            // Upload wp-content.tar.gz
-            const wpResponse = await container.fetch(
-              new Request("https://localhost/__trigger_backup.php?action=get&file=wp-content.tar.gz")
-            );
-            if (wpResponse.ok) {
-              const wpData = await wpResponse.arrayBuffer();
-              await env.DATA_BUCKET.put("backup/wp-content.tar.gz", wpData);
-              console.log(`[CRON] ✅ wp-content.tar.gz backed up (${wpData.byteLength} bytes)`);
-            }
+            const wpResponse = await container.fetch(new Request("https://localhost/__trigger_backup.php?action=get&file=wp-content.tar.gz"));
+            if (wpResponse.ok) await env.DATA_BUCKET.put("backup/wp-content.tar.gz", await wpResponse.arrayBuffer());
             
-            // Upload timestamp.txt
-            const tsResponse = await container.fetch(
-              new Request("https://localhost/__trigger_backup.php?action=get&file=timestamp.txt")
-            );
-            if (tsResponse.ok) {
-              const tsData = await tsResponse.arrayBuffer();
-              await env.DATA_BUCKET.put("backup/timestamp.txt", tsData);
-              console.log(`[CRON] ✅ timestamp.txt backed up`);
-            }
-            
+            const tsResponse = await container.fetch(new Request("https://localhost/__trigger_backup.php?action=get&file=timestamp.txt"));
+            if (tsResponse.ok) await env.DATA_BUCKET.put("backup/timestamp.txt", await tsResponse.arrayBuffer());
+
+            let snapshotTime = new Date().toISOString();
+            try { const tsObj = await env.DATA_BUCKET.get("backup/timestamp.txt"); if (tsObj) snapshotTime = (await tsObj.text()).trim(); } catch {}
+
+            await logEvent(env.DATA_BUCKET, "BACKUP_COMPLETE", { trigger: "cron", snapshotTimestamp: snapshotTime });
             console.log(`[CRON] ====== BACKUP COMPLETED ====== ${new Date().toISOString()}`);
-          } else {
-            console.log("[CRON] Backup generation did not complete successfully");
           }
-        } else {
-          console.log(`[CRON] Generate request failed: ${generateResponse.status}`);
         }
-      } catch (backupError) {
-        console.error("[CRON] Backup failed:", backupError);
+      } catch (e) {
+        await logEvent(env.DATA_BUCKET, "BACKUP_FAILED", { trigger: "cron", error: String(e) });
       }
     } catch (error) {
-      console.error("[CRON] ====== SCHEDULED TASK FAILED ======", error);
+      console.error("[CRON] SCHEDULED TASK FAILED:", error);
     }
-    
     console.log(`[CRON] ====== SCHEDULED TASK ENDED ====== ${new Date().toISOString()}`);
   },
 };

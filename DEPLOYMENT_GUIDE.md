@@ -67,7 +67,7 @@
    - `/wp-admin/install.php` → Check for auto-restore
    - Everything else → Forward to Container
 3. **Container** runs WordPress (Apache + PHP + MariaDB)
-4. **Cron Backup** (every 30 minutes): Worker triggers → Container generates → Worker uploads to R2
+4. **Cron Backup** (every 2 minutes): Worker triggers → Container generates → Worker uploads to R2 (only if valid)
 5. **Auto-Restore** (when install.php detected): Worker downloads from R2 → Push to Container → Apply restore
 
 ### Key Components
@@ -369,14 +369,12 @@ WHERE option_name IN ('siteurl', 'home');
 
 ### Automatic Backup
 
-Backups run automatically in two ways:
+Backups run automatically via Cron every **2 minutes**.
 
-1. **Scheduled backup**: Every 5 minutes via cron job
-2. **Event-triggered backup**: Automatically after:
-   - WordPress installation completes
-   - Theme activation/switch
-   - Plugin activation/deactivation
-   - WordPress core update
+**Backup Validation:**
+- Backups are only saved if `database.sql ≥ 50KB`
+- This prevents saving empty or incomplete database backups
+- Check `/__status` for `isValid: true` to confirm valid backup
 
 **What's backed up:**
 - Full database dump (`database.sql`)
@@ -391,6 +389,13 @@ Backups run automatically in two ways:
 - Cache files
 - Temporary files
 
+**Event-triggered backup preparation:**
+After these events, local backup files are generated (uploaded on next Cron):
+- WordPress installation completes
+- Theme activation/switch
+- Plugin activation/deactivation
+- WordPress core update
+
 ### Manual Backup
 
 #### Method 1: Via URL (Recommended)
@@ -401,27 +406,41 @@ Visit this URL to trigger an immediate backup:
 https://your-site/__backup/now
 ```
 
+This will:
+1. Generate backup files
+2. Validate database size (must be ≥ 50KB)
+3. Upload to R2 immediately
+
 #### Method 2: Via WordPress Admin
 
 1. Go to **Tools → R2 Backup** in WordPress admin
-2. Click **"Backup Now"** button
-3. Wait 10-30 seconds
-4. Refresh to confirm backup completed
+2. Click **"Prepare Backup Files"** button
+3. Then click **"Upload to R2 Now"** or wait for next Cron (within 2 minutes)
 
-#### Method 3: Via Terminal (if you have container access)
+### Important: After WordPress Installation
 
-```bash
-/scripts/sync.sh push
+After completing WordPress installation:
+1. **Wait up to 2 minutes** for Cron to run automatically, OR
+2. **Visit `/__backup/now`** to backup immediately
+3. **Check `/__status`** - ensure `isValid: true`
+
+```
+✅  First backup workflow:
+    1. Complete WordPress installation
+    2. Visit /__backup/now (or wait 2 minutes)
+    3. Check /__status - verify isValid: true
+    4. You're protected!
 ```
 
 ### Important: Before Redeploying
 
 **Always ensure your data is backed up before running `npx wrangler deploy`:**
 
-1. Visit `/__status` and check `lastBackup` time
-2. If your recent changes aren't backed up:
+1. Visit `/__status` and check:
+   - `lastBackup` time is recent
+   - `isValid` is `true`
+2. If not valid or recent:
    - Visit `/__backup/now` to trigger backup
-   - Wait 30 seconds
    - Check `/__status` again to confirm
 3. Then proceed with `npx wrangler deploy`
 
@@ -431,8 +450,8 @@ https://your-site/__backup/now
     
     Safe workflow:
     1. Make changes in WordPress
-    2. Visit /__backup/now (or wait 5 minutes)
-    3. Verify at /__status
+    2. Visit /__backup/now (or wait up to 2 minutes)
+    3. Verify at /__status (isValid: true)
     4. npx wrangler deploy
 ```
 
@@ -444,10 +463,18 @@ Response:
 ```json
 {
   "status": "running",
+  "containerInfo": {
+    "sleepAfter": "168h (7 days)",
+    "cronSchedule": "*/2 * * * * (every 2 minutes)"
+  },
   "backup": {
     "files": 3,
     "totalSizeBytes": 1234567,
     "totalSizeMB": "1.18",
+    "lastBackup": "20260127_123456",
+    "isValid": true,
+    "validationNote": "✅ Backup is valid (database.sql > 50KB)"
+  }
     "lastBackup": "20260126_123456"
   }
 }
@@ -497,7 +524,7 @@ All logs are available in Cloudflare Dashboard:
 |--------|-------------|
 | `[CONTAINER]` | Container lifecycle events (start/stop) |
 | `[REQUEST]` | Incoming HTTP requests |
-| `[CRON]` | Scheduled backup tasks (every 30 minutes) |
+| `[CRON]` | Scheduled backup tasks (every 2 minutes) |
 | `[AUTO-RESTORE]` | Automatic restore detection and process |
 | `[RESTORE]` | Detailed restore operation logs |
 
@@ -512,7 +539,7 @@ All logs are available in Cloudflare Dashboard:
 **Cron Backup:**
 ```
 [CRON] ====== SCHEDULED TASK STARTED ====== 2026-01-27T10:30:00.000Z
-[CRON] Event type: */30 * * * *
+[CRON] Event type: */2 * * * *
 [CRON] Sending keep-alive ping...
 [CRON] Ping response status: 200
 [CRON] Starting backup...
@@ -543,7 +570,7 @@ Check current status via `/__status`:
   "status": "running",
   "containerInfo": {
     "sleepAfter": "168h (7 days)",
-    "cronSchedule": "*/30 * * * * (every 30 minutes)"
+    "cronSchedule": "*/2 * * * * (every 2 minutes)"
   },
   "backup": {
     "files": 3,
@@ -817,18 +844,18 @@ Request            No activity            Container sleeps
 The project is configured with:
 
 1. **Sleep timeout**: 168 hours / 7 days (`sleepAfter = "168h"` - maximum allowed)
-2. **Cron keep-alive + backup**: Every 30 minutes (`*/30 * * * *` in `wrangler.jsonc`)
+2. **Cron keep-alive + backup**: Every 2 minutes (`*/2 * * * *` in `wrangler.jsonc`)
 3. **Auto-restore**: Automatically restores from R2 when `install.php` is detected
 
 ```
 Timeline with keep-alive and auto-restore:
 
-0min ──── 30min ──── 60min ──── 90min ──── 120min
-  │         │          │          │          │
-  │       Cron       Cron       Cron       Cron
-  │    (ping+backup) (ping+backup)  ...    (ping+backup)
-  │         │          │          │          │
-  └─────────┴──────────┴──────────┴──────────┴── Container stays active
+0min ── 2min ── 4min ── 6min ── 8min ── 10min
+  │       │       │       │       │       │
+  │     Cron    Cron    Cron    Cron    Cron
+  │  (ping+backup)  ...   ...    ...    ...
+  │       │       │       │       │       │
+  └───────┴───────┴───────┴───────┴───────┴── Container stays active
 
 If container restarts unexpectedly:
   │
@@ -836,7 +863,15 @@ If container restarts unexpectedly:
 User visits site → WordPress shows install.php → Worker detects this
   │
   ▼
-Auto-restore from R2 → Redirect to homepage → Site restored!
+R2 has valid backup (database.sql ≥ 50KB)?
+  │                 │
+ Yes               No
+  │                 │
+  ▼                 ▼
+Auto-restore    Show fresh install page
+  │
+  ▼
+Redirect to homepage → Site restored!
 ```
 
 ### Adjusting Sleep Behavior
@@ -861,7 +896,7 @@ Edit `wrangler.jsonc`:
 
 ```jsonc
 "triggers": {
-  "crons": ["*/30 * * * *"]  // Current: every 30 minutes
+  "crons": ["*/2 * * * *"]  // Current: every 2 minutes
 }
 ```
 
@@ -869,7 +904,8 @@ Edit `wrangler.jsonc`:
 
 | Cron Expression | Description |
 |-----------------|-------------|
-| `*/30 * * * *` | Every 30 minutes (current) |
+| `*/2 * * * *` | Every 2 minutes (current) |
+| `*/5 * * * *` | Every 5 minutes |
 | `*/15 * * * *` | Every 15 minutes |
 | `0 * * * *` | Every hour |
 | `0 */2 * * *` | Every 2 hours |
@@ -883,7 +919,7 @@ To let the container sleep naturally, remove the cron trigger from `wrangler.jso
 ```jsonc
 // Remove this section:
 "triggers": {
-  "crons": ["*/30 * * * *"]
+  "crons": ["*/2 * * * *"]
 },
 ```
 
