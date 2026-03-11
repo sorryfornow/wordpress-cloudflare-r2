@@ -13,9 +13,9 @@ Run your WordPress site on Cloudflare's global edge network with automatic backu
 - **🔄 Auto Backup** - Every 2 minutes via Cron trigger
 - **♻️ Auto Restore** - Automatically restores from R2 when container restarts
 - **📋 Persistent Event Log** - Container recycles, restores, and backups logged to R2 (`logs/events.json`), survives container recycling
-- **⚡ One-Click Deploy** - Simple deployment with `npx wrangler deploy`
+- **⚡ Interactive Setup** - `setup.sh` configures and deploys in one flow
 - **🛡️ Built-in Security** - Cloudflare's WAF, DDoS protection included
-- **💰 Cost Effective** - ~$5-15/month for personal sites
+- **💰 Cost Effective** - ~$5-15/month per site
 
 ## 📐 Architecture
 
@@ -50,27 +50,48 @@ User Request
 - Docker Desktop (running)
 - Cloudflare account with Workers Paid plan ($5/month)
 
-### Deployment
+### Deployment (Interactive)
 
 ```bash
-# 1. Clone the repository
 git clone https://github.com/sorryfornow/wordpress-cloudflare-r2.git
 cd wordpress-cloudflare-r2
-
-# 2. Install dependencies
-npm install
-
-# 3. Login to Cloudflare
-npx wrangler login
-
-# 4. Create R2 bucket
-npx wrangler r2 bucket create wordpress-data
-
-# 5. Deploy (first time takes 5-10 minutes)
-npx wrangler deploy
+bash setup.sh
 ```
 
+The script will prompt you for:
+
+| Prompt | Example | Default |
+|--------|---------|---------|
+| Worker name | `wordpress-r2` | `wordpress-r2` |
+| R2 bucket name | `wordpress-r2-data` | `<worker-name>-data` |
+| Custom domain | `blog.example.com` | *(skip)* |
+
+It then automatically:
+1. Updates `wrangler.jsonc` with your inputs
+2. Runs `npm install`
+3. Checks / performs `wrangler login`
+4. Creates the R2 bucket
+5. Deploys the Worker
+
 After deployment, visit your Workers URL and complete the WordPress installation wizard.
+
+### Deploying a Second (or Third) Site
+
+Each site needs a unique Worker name and R2 bucket. Clone into a new directory and run `setup.sh` again with different values:
+
+```bash
+git clone https://github.com/sorryfornow/wordpress-cloudflare-r2.git wordpress-site2
+cd wordpress-site2
+bash setup.sh
+```
+
+```
+Worker name  : wordpress-site2
+R2 bucket    : wordpress-site2-data
+Custom domain: site2.example.com   (optional)
+```
+
+Each site gets a fully independent Worker, container, R2 bucket, backup, and event log.
 
 ### Updating (Worker code only)
 
@@ -105,10 +126,20 @@ The container keeps running and existing data is unaffected.
 - Check `/__status` to verify last backup time
 
 ### Automatic Restore
-- Triggered when container restarts and WordPress loses state
-- Worker detects `install.php` request
-- Automatically restores from R2 backup
-- Redirects to homepage after restore
+
+There are two layers of automatic restore:
+
+**1. Proactive restore via Cron (primary)**
+- Every 2 minutes, cron checks if WordPress has lost state (`needsRestore=true`)
+- If detected, cron immediately triggers a restore from R2 — no user visit required
+- Container is typically recovered within 2 minutes of a recycle event
+- All proactive restores are logged with `trigger: "cron (proactive)"`
+
+**2. Reactive restore via install.php (fallback)**
+- If a user visits before cron has run, the Worker intercepts the `install.php` request
+- Returns a friendly "waking up" page immediately (no blank screen or browser spinner)
+- Page JS triggers restore in the background and polls `/__status` every 5 seconds
+- Automatically redirects to homepage once the site is back online
 
 ### Manual Operations
 ```bash
@@ -145,7 +176,7 @@ All critical lifecycle events are written to `logs/events.json` in R2, independe
 
 ### Retention
 
-Events older than **90 days** are automatically pruned on each write. There is no entry count limit — storage is bounded purely by the 90-day window.
+Events older than **30 days** are automatically pruned on each write. There is no entry count limit — storage is bounded purely by the 30-day window.
 
 ### Query Examples
 
@@ -167,7 +198,7 @@ Query `/__logs` for a full history of container recycles, restores, and backups 
 
 ### Cloudflare Real-time Logs
 For live cron/request activity:
-1. Go to **Workers & Pages** → **wordpress-r2**
+1. Go to **Workers & Pages** → **your-worker-name**
 2. Click **Logs** tab
 3. Select **Real-time Logs**
 
@@ -183,6 +214,7 @@ Console log prefixes:
 
 ```
 wordpress-r2/
+├── setup.sh                  # Interactive setup & deploy script
 ├── src/
 │   └── index.ts              # Cloudflare Worker (routing, backup, restore, event log)
 ├── container/
@@ -195,7 +227,7 @@ wordpress-r2/
 │   └── scripts/
 │       ├── startup.sh        # Container startup script
 │       └── sync.sh           # Backup script
-├── wrangler.jsonc            # Cloudflare deployment config
+├── wrangler.jsonc            # Cloudflare deployment config (edited by setup.sh)
 ├── DEPLOYMENT_GUIDE.md       # Full documentation
 └── README.md                 # This file
 ```
@@ -203,10 +235,11 @@ wordpress-r2/
 ## ⚠️ Important Notes
 
 ### Container Behavior
-- `sleepAfter`: 168 hours (7 days maximum)
-- Cron keeps container alive with 2-minute pings
-- Container may still restart due to Cloudflare infrastructure updates
-- All logs are stored in R2 and are unaffected by container recycling
+- `sleepAfter`: 168 hours (7 days maximum — Cloudflare's upper limit)
+- Cron pings container every 2 minutes, resetting the inactivity timer — container should never sleep under normal operation
+- Cloudflare infrastructure migrations can still force a recycle at any time, regardless of activity
+- Cron detects and recovers from recycles within 2 minutes via proactive restore
+- All logs are stored in R2 and survive container recycling
 
 ### Data Safety
 - Always ensure a valid backup exists before making changes
@@ -228,7 +261,7 @@ wordpress-r2/
 | Container | - | ~$0.02/hour running |
 | R2 Storage | 10GB | $0.015/GB/month |
 
-**Estimated monthly cost for low-traffic personal site: $5-15**
+**Estimated monthly cost per site: $5-15**
 
 ## 🤝 Contributing
 
@@ -239,11 +272,7 @@ Pull requests are welcome! Feel free to:
 - Improve documentation
 - Submit pull requests
 
-## 📄 License
-
-MIT License - feel free to use and modify.
 
 ## 🙏 Acknowledgments
 
 - Built for [Cloudflare Containers](https://developers.cloudflare.com/containers/)
-- Created with assistance from Claude AI

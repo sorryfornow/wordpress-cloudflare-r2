@@ -28,7 +28,7 @@ interface LogEvent {
 
 // 保留最近 90 天的事件，无条数上限
 // Keep events from the last 90 days, no entry count cap
-const RETENTION_DAYS = 90;
+const RETENTION_DAYS = 30;
 
 async function logEvent(
   bucket: R2Bucket,
@@ -224,84 +224,181 @@ export class WordPressContainer extends Container {
     if (pathname.includes("install.php")) {
       console.log("[AUTO-RESTORE] ====== DETECTED INSTALL.PHP ======");
 
+      // Log the recycle event
       await logEvent(this.env.DATA_BUCKET, "CONTAINER_RECYCLED", {
         url: request.url,
         userAgent: request.headers.get("user-agent") || "unknown",
         message: "install.php accessed — container recycled and lost state",
       });
 
+      // Check whether we have a valid backup to restore from
       const r2List = await this.env.DATA_BUCKET.list({ prefix: "backup/" });
       const dbBackup = r2List.objects.find(obj => obj.key === "backup/database.sql");
-      const minDbSize = 50 * 1024;
-      
-      if (dbBackup) {
-        if (dbBackup.size < minDbSize) {
-          await logEvent(this.env.DATA_BUCKET, "RESTORE_SKIPPED", {
-            reason: "database.sql too small",
-            dbSize: dbBackup.size,
-            minRequired: minDbSize,
-          });
-        } else if (r2List.objects.length >= 2) {
-          await logEvent(this.env.DATA_BUCKET, "RESTORE_START", {
-            trigger: "auto (install.php)",
-            r2Files: r2List.objects.map(o => ({ key: o.key, size: o.size })),
-          });
-          
-          try {
-            const restoreResult = await this.performRestore(request.url);
-            
-            if (restoreResult.success) {
-              let snapshotTime = "unknown";
-              try {
-                const tsObj = await this.env.DATA_BUCKET.get("backup/timestamp.txt");
-                if (tsObj) snapshotTime = (await tsObj.text()).trim();
-              } catch {}
+      const hasValidBackup = dbBackup && dbBackup.size >= 50 * 1024 && r2List.objects.length >= 2;
 
-              await logEvent(this.env.DATA_BUCKET, "RESTORE_SUCCESS", {
-                trigger: "auto (install.php)",
-                snapshotTimestamp: snapshotTime,
-              });
+      // Read snapshot timestamp for display (non-blocking)
+      let snapshotTime = "unknown";
+      try {
+        const tsObj = await this.env.DATA_BUCKET.get("backup/timestamp.txt");
+        if (tsObj) snapshotTime = (await tsObj.text()).trim();
+      } catch {}
 
-              return new Response(
-                `<!DOCTYPE html>
-<html>
+      if (!hasValidBackup) {
+        await logEvent(this.env.DATA_BUCKET, "RESTORE_SKIPPED", {
+          reason: dbBackup ? "database.sql too small" : "No backup in R2 — fresh install",
+          dbSize: dbBackup?.size ?? 0,
+        });
+        // No backup — fall through to show WordPress install wizard
+      } else {
+        // ── Immediately return a friendly "waking up" page ──────────
+        // The page JS will call /__restore/now and poll /__status,
+        // so the user never sees a blank screen or browser spinner.
+        await logEvent(this.env.DATA_BUCKET, "RESTORE_START", {
+          trigger: "auto (install.php)",
+          snapshotTimestamp: snapshotTime,
+        });
+
+        const origin = new URL(request.url).origin;
+
+        return new Response(`<!DOCTYPE html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="refresh" content="3;url=/">
-  <title>WordPress Restored</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Site is waking up…</title>
   <style>
-    body { font-family: sans-serif; text-align: center; padding: 50px; }
-    .success { color: green; }
-    pre { text-align: left; background: #f5f5f5; padding: 20px; max-width: 600px; margin: 20px auto; overflow: auto; font-size: 12px; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #f5f5f5;
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100vh; padding: 20px;
+    }
+    .card {
+      background: #fff;
+      max-width: 440px; width: 100%;
+      padding: 48px 40px;
+      text-align: center;
+      border-top: 4px solid #1a1a1a;
+    }
+    .spinner {
+      width: 36px; height: 36px;
+      border: 3px solid #e0e0e0;
+      border-top-color: #1a1a1a;
+      border-radius: 50%;
+      margin: 0 auto 28px;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    h1 { font-size: 1.2em; font-weight: 600; color: #1a1a1a; margin-bottom: 10px; }
+    .sub { font-size: 0.9em; color: #777; line-height: 1.6; margin-bottom: 24px; }
+    .snapshot { font-size: 0.78em; color: #aaa; font-family: 'Courier New', monospace; margin-bottom: 28px; }
+    .status-row {
+      display: flex; align-items: center; gap: 10px;
+      background: #f8f8f8; padding: 10px 14px;
+      font-size: 0.82em; color: #555; margin-bottom: 8px;
+      text-align: left;
+    }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+      background: #ccc;
+    }
+    .dot.active { background: #4caf50; animation: pulse 1s ease-in-out infinite; }
+    .dot.done   { background: #4caf50; }
+    .dot.error  { background: #f44336; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .manual { margin-top: 24px; font-size: 0.8em; color: #bbb; }
+    .manual a { color: #888; }
+    .success-msg { display:none; color: #2e7d32; font-weight:600; margin-bottom:10px; }
+    .error-msg   { display:none; color: #c62828; font-size:0.85em; margin-top:16px; }
   </style>
 </head>
 <body>
-  <h1 class="success">✅ WordPress Restored from Backup!</h1>
-  <p>Snapshot time: <strong>${snapshotTime}</strong></p>
-  <p>Redirecting to homepage in 3 seconds...</p>
-  <p><a href="/">Click here if not redirected</a></p>
-  <pre>${restoreResult.message}</pre>
-</body>
-</html>`,
-                { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } }
-              );
-            } else {
-              await logEvent(this.env.DATA_BUCKET, "RESTORE_FAILED", {
-                trigger: "auto (install.php)",
-                message: restoreResult.message.slice(0, 500),
-              });
-            }
-          } catch (e) {
-            await logEvent(this.env.DATA_BUCKET, "RESTORE_FAILED", {
-              trigger: "auto (install.php)",
-              error: String(e),
-            });
-          }
+<div class="card">
+  <div class="spinner" id="spinner"></div>
+  <div class="success-msg" id="successMsg">✅ Restored! Redirecting…</div>
+  <h1>The site is waking up</h1>
+  <p class="sub">The server was recycled and is being restored from the latest backup. This usually takes 30–60 seconds.</p>
+  <p class="snapshot">Snapshot: ${snapshotTime}</p>
+
+  <div class="status-row"><div class="dot done"></div>Backup found in R2</div>
+  <div class="status-row" id="rowRestore"><div class="dot active" id="dotRestore"></div><span id="msgRestore">Restoring from snapshot…</span></div>
+  <div class="status-row" id="rowReady"  style="opacity:0.4"><div class="dot" id="dotReady"></div><span id="msgReady">Waiting for site to come online…</span></div>
+
+  <div class="error-msg" id="errorMsg">
+    Restore is taking longer than expected. <a href="/">Try refreshing manually</a>.
+  </div>
+  <p class="manual">You can also <a href="/__restore/now">trigger a restore manually</a>.</p>
+</div>
+
+<script>
+(function () {
+  var origin = '${origin}';
+  var restoreDone = false;
+  var giveUpAt = Date.now() + 3 * 60 * 1000; // 3 minute total timeout
+
+  // Step 1: Trigger restore (fire and don't wait — response may take 60s)
+  fetch(origin + '/__restore/now')
+    .then(function (r) {
+      restoreDone = true;
+      document.getElementById('dotRestore').className = 'dot done';
+      document.getElementById('msgRestore').textContent = r.ok ? 'Restore complete' : 'Restore finished (check logs)';
+    })
+    .catch(function () {
+      // Network error — may still have worked
+      restoreDone = true;
+    });
+
+  // Step 2: Poll /__status every 5s until WordPress responds normally
+  function updateRow(rowId, dotId, msgId, dotClass, msg) {
+    document.getElementById(rowId).style.opacity = '1';
+    document.getElementById(dotId).className = 'dot ' + dotClass;
+    document.getElementById(msgId).textContent = msg;
+  }
+
+  var pollTimer = setInterval(function () {
+    if (Date.now() > giveUpAt) {
+      clearInterval(pollTimer);
+      document.getElementById('errorMsg').style.display = 'block';
+      document.getElementById('spinner').style.display = 'none';
+      return;
+    }
+
+    fetch(origin + '/__status')
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.status === 'running') {
+          clearInterval(pollTimer);
+          updateRow('rowReady', 'dotReady', 'msgReady', 'done', 'Site is online!');
+          document.getElementById('successMsg').style.display = 'block';
+          document.getElementById('spinner').style.display = 'none';
+          setTimeout(function () { window.location.href = '/'; }, 2000);
         }
-      } else {
-        await logEvent(this.env.DATA_BUCKET, "RESTORE_SKIPPED", {
-          reason: "No database.sql in R2 — fresh install",
-        });
+      })
+      .catch(function () {
+        // Still starting — keep polling
+        updateRow('rowReady', 'dotReady', 'msgReady', 'active', 'Waiting for site to come online…');
+      });
+  }, 5000);
+
+  // Also do one immediate poll after 8s (restore needs a head start)
+  setTimeout(function () {
+    fetch(origin + '/__status')
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.status === 'running') {
+          clearInterval(pollTimer);
+          updateRow('rowReady', 'dotReady', 'msgReady', 'done', 'Site is online!');
+          document.getElementById('successMsg').style.display = 'block';
+          document.getElementById('spinner').style.display = 'none';
+          setTimeout(function () { window.location.href = '/'; }, 2000);
+        }
+      }).catch(function () {});
+  }, 8000);
+})();
+</script>
+</body>
+</html>`, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
     }
 
@@ -491,6 +588,7 @@ export default {
       
       if (!keepAliveSuccess) { console.log("[CRON] Container unreachable, skipping backup"); return; }
       
+      // ── Check if WordPress is installed or needs restore ──────
       let shouldBackup = false;
       try {
         const checkResponse = await container.fetch(
@@ -498,10 +596,74 @@ export default {
         );
         if (checkResponse.ok) {
           const checkData = await checkResponse.json() as { needsRestore: boolean };
-          shouldBackup = !checkData.needsRestore;
+
+          if (checkData.needsRestore) {
+            // ── WordPress lost state — trigger proactive restore ───
+            console.log("[CRON] ⚠️ WordPress needs restore — triggering proactive restore...");
+
+            await logEvent(env.DATA_BUCKET, "CONTAINER_RECYCLED", {
+              trigger: "cron detected",
+              message: "needsRestore=true detected by cron — container was recycled",
+            });
+
+            // Check R2 has a valid backup before attempting
+            const r2List = await env.DATA_BUCKET.list({ prefix: "backup/" });
+            const dbBackup = r2List.objects.find(o => o.key === "backup/database.sql");
+            const hasValidBackup = dbBackup && dbBackup.size >= 50 * 1024 && r2List.objects.length >= 2;
+
+            if (!hasValidBackup) {
+              console.log("[CRON] No valid backup in R2, skipping restore");
+              await logEvent(env.DATA_BUCKET, "RESTORE_SKIPPED", {
+                trigger: "cron",
+                reason: dbBackup ? "database.sql too small" : "No backup in R2",
+              });
+              return;
+            }
+
+            await logEvent(env.DATA_BUCKET, "RESTORE_START", { trigger: "cron (proactive)" });
+
+            // Delegate to container's /__restore/now — it handles
+            // the full restore logic and writes RESTORE_SUCCESS/FAILED
+            try {
+              const restoreResponse = await container.fetch(
+                new Request("https://localhost/__restore/now")
+              );
+              const restoreText = await restoreResponse.text();
+              const success = restoreResponse.ok && restoreText.includes("✅");
+
+              if (success) {
+                let snapshotTime = "unknown";
+                try {
+                  const tsObj = await env.DATA_BUCKET.get("backup/timestamp.txt");
+                  if (tsObj) snapshotTime = (await tsObj.text()).trim();
+                } catch {}
+                console.log(`[CRON] ✅ Proactive restore complete. Snapshot: ${snapshotTime}`);
+                await logEvent(env.DATA_BUCKET, "RESTORE_SUCCESS", {
+                  trigger: "cron (proactive)",
+                  snapshotTimestamp: snapshotTime,
+                });
+              } else {
+                console.log("[CRON] ❌ Proactive restore failed");
+                await logEvent(env.DATA_BUCKET, "RESTORE_FAILED", {
+                  trigger: "cron (proactive)",
+                  message: restoreText.slice(0, 500),
+                });
+              }
+            } catch (restoreErr) {
+              console.error("[CRON] Proactive restore exception:", restoreErr);
+              await logEvent(env.DATA_BUCKET, "RESTORE_FAILED", {
+                trigger: "cron (proactive)",
+                error: String(restoreErr),
+              });
+            }
+
+            return; // Don't attempt backup this cycle — restored state needs one full cycle first
+          } else {
+            shouldBackup = true;
+          }
         }
       } catch { shouldBackup = true; }
-      
+
       if (!shouldBackup) return;
       
       try {
