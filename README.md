@@ -10,7 +10,8 @@ Run your WordPress site on Cloudflare's global edge network with automatic backu
 
 - **🌍 Global Edge Deployment** - WordPress runs on Cloudflare's 300+ edge locations
 - **💾 Persistent Storage** - Database and uploads automatically backed up to R2
-- **🔄 Auto Backup** - Every 2 minutes via Cron trigger
+- **🔄 Auto Backup** - Database every 10 minutes, wp-content every 6 hours via Cron
+- **📸 Snapshot Protection** - Hourly snapshots (last 24h) and daily snapshots (last 7 days) stored in R2
 - **♻️ Auto Restore** - Automatically restores from R2 when container restarts
 - **📋 Persistent Event Log** - Container recycles, restores, and backups logged to R2 (`logs/events.json`), survives container recycling
 - **⚡ Interactive Setup** - `setup.sh` configures and deploys in one flow
@@ -112,6 +113,8 @@ The container keeps running and existing data is unaffected.
 | `/__status` | Backup status & container info (JSON) |
 | `/__logs` | Persistent event log (JSON) |
 | `/__logs?type=CONTAINER_RECYCLED` | Filter by event type |
+| `/__snapshots` | List available hourly and daily snapshots |
+| `/__restore?from=hourly/2026031102` | Restore from a specific snapshot |
 | `/__logs?limit=20` | Limit results |
 | `/__backup/now` | Trigger manual backup |
 | `/__restore/now` | Trigger manual restore from R2 |
@@ -120,10 +123,40 @@ The container keeps running and existing data is unaffected.
 ## 🔄 Backup & Restore
 
 ### Automatic Backup
-- Cron runs every 2 minutes
-- Backs up database and wp-content to R2
+
+Backup frequency is split by file type to balance data safety with performance:
+
+| File | Frequency | Rationale |
+|------|-----------|-----------|
+| `database.sql` | Every 10 minutes | Posts, settings, comments — changes frequently but small |
+| `wp-content.tar.gz` | Every 6 hours | Media files — large, changes infrequently |
+
+Intervals are tracked via timestamp files in R2 (not wall-clock schedule), so timing is based on actual elapsed time. On the very first run (no timestamp exists), both files are backed up immediately.
+
 - Only runs if WordPress is fully installed (database.sql > 50KB)
 - Check `/__status` to verify last backup time
+
+### Snapshot Protection
+
+Beyond the rolling latest backup, snapshots are taken automatically and stored independently in R2:
+
+| Snapshot | Frequency | Retention | Contents | Use case |
+|----------|-----------|-----------|----------|----------|
+| `snapshots/hourly/YYYYMMDDHH/` | Every hour | Last 24 | database.sql only | Recover deleted posts, accidental changes |
+| `snapshots/daily/YYYYMMDD/` | Every day | Last 7 | database.sql + wp-content | Full rollback from hack or major incident |
+
+Snapshots are copied from the current `backup/` files — no extra container load. Restoring from a specific snapshot:
+
+```bash
+# List available snapshots
+curl https://your-site/__snapshots
+
+# Restore from a specific hourly snapshot
+curl https://your-site/__restore?from=hourly/2026031102
+
+# Restore from a specific daily snapshot
+curl https://your-site/__restore?from=daily/20260311
+```
 
 ### Automatic Restore
 
@@ -171,12 +204,16 @@ All critical lifecycle events are written to `logs/events.json` in R2, independe
 | `RESTORE_SKIPPED` | Backup invalid or missing, skipped restore |
 | `BACKUP_COMPLETE` | Backup written to R2 successfully |
 | `BACKUP_FAILED` | Backup failed (includes reason) |
-| `MANUAL_RESTORE` | Restore triggered via `/__restore/now` |
+| `MANUAL_RESTORE` | Restore triggered via `/__restore` |
 | `MANUAL_BACKUP` | Backup triggered via `/__backup/now` |
+| `SNAPSHOT_HOURLY` | Hourly snapshot written to `snapshots/hourly/` |
+| `SNAPSHOT_DAILY` | Daily snapshot written to `snapshots/daily/` |
 
 ### Retention
 
 Events older than **30 days** are automatically pruned on each write. There is no entry count limit — storage is bounded purely by the 30-day window.
+
+Snapshots are pruned automatically: hourly keeps the last 24, daily keeps the last 7.
 
 ### Query Examples
 
@@ -271,8 +308,3 @@ Pull requests are welcome! Feel free to:
 - Suggest features
 - Improve documentation
 - Submit pull requests
-
-
-## 🙏 Acknowledgments
-
-- Built for [Cloudflare Containers](https://developers.cloudflare.com/containers/)
