@@ -1,5 +1,7 @@
 # WordPress on Cloudflare Containers + R2
 
+> **Version 1.3.0** — Tiered backup intervals · Hourly/daily snapshot protection · Persistent R2 event log · Proactive cron restore
+
 A complete solution to run **WordPress** on **Cloudflare Containers** with **R2** for persistent data storage.
 
 ## 🚀 What is this?
@@ -30,17 +32,20 @@ User Request
      │
      ▼
 ┌─────────────────────┐     ┌──────────────────────────┐
-│  Container          │◄───►│  Cloudflare R2           │
-│  ├── Apache         │     │  ├── backup/database.sql  │
-│  ├── PHP 8.1        │     │  ├── backup/wp-content    │
-│  ├── MariaDB        │     │  ├── backup/timestamp.txt │
-│  └── WordPress      │     │  └── logs/events.json     │  ← Persistent log
-└─────────────────────┘     └──────────────────────────┘
-         ▲
-         │
-    Cron Trigger (every 2 min)
+│  Container          │◄───►│  Cloudflare R2                    │
+│  ├── Apache         │     │  ├── backup/          (latest)    │
+│  ├── PHP 8.1        │     │  │   ├── database.sql             │
+│  ├── MariaDB        │     │  │   ├── wp-content.tar.gz        │
+│  └── WordPress      │     │  │   └── timestamp.txt            │
+└─────────────────────┘     │  ├── snapshots/hourly/  (24 hrs)  │
+         ▲                  │  ├── snapshots/daily/   (7 days)  │
+         │                  │  └── logs/events.json             │
+    Cron Trigger            └───────────────────────────────────┘
+    (every 2 min)
     - Keep-alive ping
-    - Auto backup to R2
+    - Incremental backup
+    - Hourly/daily snapshots
+    - Proactive restore
 ```
 
 ## 🛠️ Quick Start
@@ -195,19 +200,161 @@ All critical lifecycle events are written to `logs/events.json` in R2, independe
 
 ### Event Types
 
-| Event | When |
-|-------|------|
-| `CONTAINER_RECYCLED` | `install.php` accessed — container lost state |
-| `RESTORE_START` | Restore from R2 initiated |
-| `RESTORE_SUCCESS` | Restore completed successfully (includes snapshot timestamp) |
-| `RESTORE_FAILED` | Restore failed (includes error detail) |
-| `RESTORE_SKIPPED` | Backup invalid or missing, skipped restore |
-| `BACKUP_COMPLETE` | Backup written to R2 successfully |
-| `BACKUP_FAILED` | Backup failed (includes reason) |
-| `MANUAL_RESTORE` | Restore triggered via `/__restore` |
-| `MANUAL_BACKUP` | Backup triggered via `/__backup/now` |
-| `SNAPSHOT_HOURLY` | Hourly snapshot written to `snapshots/hourly/` |
-| `SNAPSHOT_DAILY` | Daily snapshot written to `snapshots/daily/` |
+Each event is a JSON object with at minimum `time` (ISO 8601) and `type`. Additional fields vary by type.
+
+#### `CONTAINER_RECYCLED`
+Container lost WordPress state and needs a restore. Two sub-variants:
+
+**Triggered by user visit (install.php intercepted):**
+```json
+{
+  "time": "2026-03-11T03:13:00.971Z",
+  "type": "CONTAINER_RECYCLED",
+  "url": "https://your-site/wp-admin/install.php",
+  "userAgent": "Mozilla/5.0 ...",
+  "message": "install.php accessed — container recycled and lost state"
+}
+```
+
+**Detected by cron (proactive):**
+```json
+{
+  "time": "2026-03-11T03:14:46.667Z",
+  "type": "CONTAINER_RECYCLED",
+  "trigger": "cron detected",
+  "message": "needsRestore=true detected by cron — container was recycled"
+}
+```
+
+#### `RESTORE_START`
+Restore from R2 has been initiated. Always followed by `RESTORE_SUCCESS`, `RESTORE_FAILED`, or `RESTORE_SKIPPED`.
+```json
+{
+  "time": "2026-03-11T03:14:49.000Z",
+  "type": "RESTORE_START",
+  "trigger": "cron (proactive)"
+}
+```
+`trigger` values: `"cron (proactive)"` · `"manual /__restore"` · `"auto (install.php)"`
+
+#### `RESTORE_SUCCESS`
+Restore completed successfully.
+```json
+{
+  "time": "2026-03-11T03:14:57.176Z",
+  "type": "RESTORE_SUCCESS",
+  "trigger": "cron (proactive)",
+  "snapshotTimestamp": "20260311_031050",
+  "from": "hourly/2026031103"
+}
+```
+`from` is only present when restoring from a named snapshot (omitted for `latest/`).
+
+#### `RESTORE_FAILED`
+Restore did not complete. Check `error` or `message` for the cause.
+```json
+{
+  "time": "2026-03-11T03:00:00.000Z",
+  "type": "RESTORE_FAILED",
+  "trigger": "cron (proactive)",
+  "error": "Error: ..."
+}
+```
+
+#### `RESTORE_SKIPPED`
+No valid backup was found — restore was not attempted.
+```json
+{
+  "time": "2026-03-11T02:00:00.000Z",
+  "type": "RESTORE_SKIPPED",
+  "trigger": "cron",
+  "reason": "No backup in R2"
+}
+```
+`reason` values: `"No backup in R2"` · `"database.sql too small"`
+
+#### `BACKUP_COMPLETE`
+One or both files were successfully written to `backup/` in R2.
+```json
+{
+  "time": "2026-03-11T21:07:04.436Z",
+  "type": "BACKUP_COMPLETE",
+  "trigger": "cron",
+  "snapshotTimestamp": "20260311_210651",
+  "dbBackedUp": true,
+  "wpContentBackedUp": true
+}
+```
+`wpContentBackedUp: false` means only the database was written this cycle (wp-content interval not yet elapsed).
+
+#### `BACKUP_FAILED`
+Backup encountered an error. Common causes: R2 transient error, container unreachable, database.sql too small.
+```json
+{
+  "time": "2026-03-11T20:33:02.747Z",
+  "type": "BACKUP_FAILED",
+  "trigger": "cron",
+  "error": "Error: put: Unspecified error (0)"
+}
+```
+Single failures are almost always transient — check whether the next cron cycle produced `BACKUP_COMPLETE`.
+
+#### `MANUAL_RESTORE`
+A restore was triggered via `/__restore` or `/__restore/now`. Always paired with `RESTORE_START`.
+```json
+{
+  "time": "2026-03-11T02:54:51.367Z",
+  "type": "MANUAL_RESTORE",
+  "trigger": "manual /__restore/now",
+  "from": "latest"
+}
+```
+
+#### `MANUAL_BACKUP`
+A backup was triggered via `/__backup/now`. Always paired with `BACKUP_COMPLETE` or `BACKUP_FAILED`.
+```json
+{
+  "time": "2026-03-11T02:00:00.000Z",
+  "type": "MANUAL_BACKUP",
+  "trigger": "manual /__backup/now"
+}
+```
+
+#### `SNAPSHOT_HOURLY`
+An hourly snapshot was copied from `backup/` to `snapshots/hourly/YYYYMMDDHH/`. Only contains `database.sql`.
+```json
+{
+  "time": "2026-03-11T21:00:00.000Z",
+  "type": "SNAPSHOT_HOURLY",
+  "folder": "2026031121",
+  "files": ["database.sql"]
+}
+```
+
+#### `SNAPSHOT_DAILY`
+A daily snapshot was copied from `backup/` to `snapshots/daily/YYYYMMDD/`. Contains database and wp-content.
+```json
+{
+  "time": "2026-03-11T00:00:00.000Z",
+  "type": "SNAPSHOT_DAILY",
+  "folder": "20260311",
+  "files": ["database.sql", "wp-content.tar.gz", "timestamp.txt"]
+}
+```
+
+#### Quick filter reference
+
+| To investigate... | Query |
+|-------------------|-------|
+| All container recycles | `/__logs?type=CONTAINER_RECYCLED` |
+| All restore attempts | `/__logs?type=RESTORE_START` |
+| Successful restores | `/__logs?type=RESTORE_SUCCESS` |
+| Failed restores | `/__logs?type=RESTORE_FAILED` |
+| Skipped restores | `/__logs?type=RESTORE_SKIPPED` |
+| All backups | `/__logs?type=BACKUP_COMPLETE` |
+| Failed backups | `/__logs?type=BACKUP_FAILED` |
+| Hourly snapshots | `/__logs?type=SNAPSHOT_HOURLY` |
+| Daily snapshots | `/__logs?type=SNAPSHOT_DAILY` |
 
 ### Retention
 
@@ -299,6 +446,15 @@ wordpress-r2/
 | R2 Storage | 10GB | $0.015/GB/month |
 
 **Estimated monthly cost per site: $5-15**
+
+## 📌 Version History
+
+| Version | Changes |
+|---------|---------|
+| **v1.3.0** | Tiered backup frequency (DB every 10 min, wp-content every 6 h); hourly snapshots (last 24) and daily snapshots (last 7); `/__snapshots` endpoint; `/__restore?from=` for named snapshot restore; `SNAPSHOT_HOURLY` and `SNAPSHOT_DAILY` event types |
+| **v1.2.0** | Proactive cron restore (detects and recovers recycles within 2 min without user visit); persistent R2 event log (`logs/events.json`) with 30-day retention; `/__logs` endpoint with type/limit filtering; "waking up" page with live status polling instead of blank screen |
+| **v1.1.0** | Split backup frequency: database every 2 min, wp-content every 30 min; timestamp-based interval tracking in R2 |
+| **v1.0.0** | Initial release: WordPress on Cloudflare Containers + R2, auto backup/restore, keep-alive cron, interactive `setup.sh` |
 
 ## 🤝 Contributing
 
